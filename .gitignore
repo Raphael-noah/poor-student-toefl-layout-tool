@@ -1,0 +1,16 @@
+# 忽略 macOS 系统文件
+.DS_Store
+
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
+
+# 忽略输出文件夹
+output_articles/
+
+# 如果你不想把原始 PDF 也传上去，可以取消下面这行的注释
+# *.pdf
+
+# 忽略我们刚才写的测试脚本（如果不需要的话）
+check_page.py
+check_ocr.py
