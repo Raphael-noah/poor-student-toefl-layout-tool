@@ -8,6 +8,8 @@ import re
 import sys
 from typing import List, Dict, Optional, Tuple
 
+import numpy as np
+
 try:
     import pymupdf as fitz
 except ImportError:
@@ -66,7 +68,7 @@ def text_layer_lines(page, dpi: int) -> List[Dict]:
             if not text:
                 continue
 
-            # 【新增】过滤水印
+            # 过滤水印
             if "闲鱼" in text or "留学考试资料库" in text:
                 continue
 
@@ -124,17 +126,17 @@ def detect_anchors(pages: List[Dict]) -> Tuple[List[Dict], Optional[Tuple[int, f
             if not t:
                 continue
 
-            # 1. 判断答案区开始（排除第一页的说明文字）
+            # 判断答案区开始
             if ("参考答案" in t or "Correct Answers" in t):
                 if "移至文末" not in t and "本题库" not in t and len(t) < 40:
                     boundary = (pi, line["y0"])
                     break
 
-            # 2. 过滤第一页的 "日期 2026-01-21 ~ 2026-09-19"
+            # 过滤第一页的日期说明
             if "日期" in t and "~" in t:
                 continue
 
-            # 3. 判断带日期的文章锚点
+            # 带日期的标题
             m = DATE_RE.search(t)
             if m:
                 date_str = m.group(0).replace(" ", "")
@@ -142,11 +144,9 @@ def detect_anchors(pages: List[Dict]) -> Tuple[List[Dict], Optional[Tuple[int, f
 
                 rest = DATE_RE.sub("", t).strip(" -:：#（）()")
 
-                # 如果只是 "(3 套)" 这种分组，跳过
                 if re.match(r"^\d+套$", rest) or not rest:
                     continue
 
-                # 如果后面跟着英文标题
                 if has_english_letters(rest):
                     title = clean_title(rest)
                     anchors.append({
@@ -157,7 +157,7 @@ def detect_anchors(pages: List[Dict]) -> Tuple[List[Dict], Optional[Tuple[int, f
                     })
                 continue
 
-            # 4. 判断无日期的独立标题 (Passage - Expert Systems)
+            # 无日期的独立标题
             t_clean = re.sub(r"^[#\s]+", "", t)
             if PASSAGE_RE.match(t_clean) or KPO_RE.match(t_clean):
                 title = clean_title(t_clean)
@@ -216,7 +216,6 @@ def render_page(doc, page_idx: int, dpi: int) -> Image.Image:
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 
-# 【修改】加入动态寻找文字边界，去除大量空白
 def crop_range(doc, start_page: int, start_y: float, end_page: int, end_y: float, dpi: int, pages: List[Dict]) -> List[
     Image.Image]:
     imgs = []
@@ -225,33 +224,21 @@ def crop_range(doc, start_page: int, start_y: float, end_page: int, end_y: float
         img = render_page(doc, pi, dpi)
         W, H = img.size
 
-        # 原始的切分限制
         y0_limit = int(max(0, start_y)) if pi == start_page else 0
         y1_limit = int(min(H, end_y)) if pi == end_page else H
 
-        # 找到这一页在当前范围内，实际有文字的上下边界
-        valid_lines = []
-        for ln in pages[pi]["lines"]:
-            if ln["y1"] > y0_limit and ln["y0"] < y1_limit:
-                valid_lines.append(ln)
+        img = img.crop((0, y0_limit, W, y1_limit))
 
-        if valid_lines:
-            # 找到最高点的顶部和最低点的底部
-            min_y0 = min(ln["y0"] for ln in valid_lines)
-            max_y1 = max(ln["y1"] for ln in valid_lines)
+        # 像素级检测，切除大段白边和杂线
+        arr = np.array(img.convert("L"))
+        valid_rows = np.where(np.any(arr < 245, axis=1))[0]
 
-            # 上下各留 15 像素的呼吸空间
-            margin = 15
-            y0 = max(0, int(min_y0 - margin))
-            y1 = min(H, int(max_y1 + margin))
-        else:
-            # 如果这一页在这篇文章范围内没有任何文字，就跳过
-            continue
-
-        if y1 - y0 < 8:
-            continue
-
-        imgs.append(img.crop((0, y0, W, y1)))
+        if len(valid_rows) > 0:
+            margin = 10
+            top = max(0, int(valid_rows[0]) - margin)
+            bottom = min(img.height, int(valid_rows[-1]) + margin)
+            img = img.crop((0, top, W, bottom))
+            imgs.append(img)
 
     return imgs
 
@@ -269,7 +256,13 @@ def vconcat(imgs: List[Image.Image]) -> Optional[Image.Image]:
     return out
 
 
+def save_as_single_pdf(img: Image.Image, path: str, dpi: int):
+    """保存为单页长图 PDF（用于文章）"""
+    img.save(path, "PDF", resolution=dpi)
+
+
 def save_as_a4_pdf(img: Image.Image, path: str, dpi: int):
+    """按 A4 比例切分并保存为多页 PDF（用于参考答案）"""
     a4_w = img.width
     a4_h = int(a4_w * 297 / 210)
     pages = []
@@ -306,15 +299,13 @@ def main():
     anchors, boundary = detect_anchors(pages)
 
     print(f"\n共识别到 {len(anchors)} 个文章锚点：")
-    for a in anchors[:10]:  # 只打印前10个看看
+    for a in anchors[:10]:
         print(f"  page {a['page'] + 1:>3}  y={int(a['y']):>5}  {a['date']:<12}  {a['title']}")
     if len(anchors) > 10:
         print(f"  ... 还有 {len(anchors) - 10} 个")
 
     if boundary is not None:
         print(f"  参考答案起始位置：page {boundary[0] + 1}  y={int(boundary[1])}")
-    else:
-        print("  未识别到参考答案起始位置。")
 
     if not anchors:
         print("没有识别到文章。", file=sys.stderr)
@@ -328,7 +319,6 @@ def main():
 
     print("\n==> 开始裁剪并输出文章 ...", flush=True)
     for u in units:
-        # 【修改】调用时多传一个 pages 参数
         imgs = crop_range(doc, u["start_page"], u["start_y"], u["end_page"], u["end_y"], args.dpi, pages)
         if not imgs:
             continue
@@ -342,7 +332,9 @@ def main():
 
         base = f"{u['date']}_{seq:02d}_{safe_filename(u['title'])}"
         out_pdf = os.path.join(args.outdir, base + ".pdf")
-        save_as_a4_pdf(long_img, out_pdf, args.dpi)
+
+        # 文章保存为单页
+        save_as_single_pdf(long_img, out_pdf, args.dpi)
 
         index.append({
             "date": u["date"],
@@ -353,17 +345,16 @@ def main():
         })
         print(f"[保存] {out_pdf}")
 
-    # 处理答案区
     if boundary is not None:
         print("\n==> 整理参考答案 ...", flush=True)
         last_page = len(pages) - 1
         last_y = pages[-1]["h_px"]
 
-        # 【修改】调用时多传一个 pages 参数
         full_imgs = crop_range(doc, boundary[0], max(0.0, boundary[1] - 5), last_page, last_y, args.dpi, pages)
         full_img = vconcat(full_imgs)
         if full_img is not None:
             full_pdf = os.path.join(answers_dir, "answers_full.pdf")
+            # 参考答案按 A4 分页保存
             save_as_a4_pdf(full_img, full_pdf, args.dpi)
             print(f"[保存] {full_pdf}")
 
