@@ -126,17 +126,15 @@ def detect_anchors(pages: List[Dict]) -> Tuple[List[Dict], Optional[Tuple[int, f
             if not t:
                 continue
 
-            # 判断答案区开始
             if ("参考答案" in t or "Correct Answers" in t):
                 if "移至文末" not in t and "本题库" not in t and len(t) < 40:
                     boundary = (pi, line["y0"])
                     break
 
-            # 过滤第一页的日期说明
             if "日期" in t and "~" in t:
                 continue
 
-            # 带日期的标题
+            # 修复：兼容日期和标题被拆成两行的情况
             m = DATE_RE.search(t)
             if m:
                 date_str = m.group(0).replace(" ", "")
@@ -144,9 +142,23 @@ def detect_anchors(pages: List[Dict]) -> Tuple[List[Dict], Optional[Tuple[int, f
 
                 rest = DATE_RE.sub("", t).strip(" -:：#（）()")
 
-                if re.match(r"^\d+套$", rest) or not rest:
+                # 如果只有日期，检查下一行是否是标题
+                if not rest:
+                    next_text = lines[li + 1]["text"].strip() if li + 1 < n else ""
+                    # 如果下一行是 "(3 套)" 这种，再看下下行的标题
+                    if re.match(r"^[（(]\d+套[)）]$", next_text):
+                        next_text = lines[li + 2]["text"].strip() if li + 2 < n else ""
+
+                    if has_english_letters(next_text):
+                        rest = next_text
+                    else:
+                        continue
+
+                # 如果是 "（3 套）" 这种分组，跳过
+                if re.match(r"^\d+套$", rest.strip("（）() ")) or not rest:
                     continue
 
+                # 找到标题
                 if has_english_letters(rest):
                     title = clean_title(rest)
                     anchors.append({
@@ -216,6 +228,7 @@ def render_page(doc, page_idx: int, dpi: int) -> Image.Image:
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 
+# 【核心修复】过滤浅色水印，且按文字间距自动切分
 def crop_range(doc, start_page: int, start_y: float, end_page: int, end_y: float, dpi: int, pages: List[Dict]) -> List[
     Image.Image]:
     imgs = []
@@ -227,18 +240,35 @@ def crop_range(doc, start_page: int, start_y: float, end_page: int, end_y: float
         y0_limit = int(max(0, start_y)) if pi == start_page else 0
         y1_limit = int(min(H, end_y)) if pi == end_page else H
 
-        img = img.crop((0, y0_limit, W, y1_limit))
+        img_roi = img.crop((0, y0_limit, W, y1_limit))
 
-        # 像素级检测，切除大段白边和杂线
-        arr = np.array(img.convert("L"))
-        valid_rows = np.where(np.any(arr < 245, axis=1))[0]
+        # 1. 转灰度图，把浅灰色的水印（>210）变成纯白，只保留黑色的文字
+        gray = img_roi.convert("L")
+        arr = np.array(gray)
+        arr_clean = np.where(arr > 210, 255, arr).astype(np.uint8)
 
-        if len(valid_rows) > 0:
-            margin = 10
-            top = max(0, int(valid_rows[0]) - margin)
-            bottom = min(img.height, int(valid_rows[-1]) + margin)
-            img = img.crop((0, top, W, bottom))
-            imgs.append(img)
+        # 2. 找出有文字内容的行号
+        valid_rows = np.where(np.any(arr_clean < 210, axis=1))[0]
+        if len(valid_rows) == 0:
+            continue
+
+        # 3. 根据行间距切割（如果两行之间的空白大于 40 像素，说明这里夹着水印或被分页，直接切开）
+        row_segments = []
+        current_seg = [valid_rows[0]]
+        for row in valid_rows[1:]:
+            if row - current_seg[-1] < 40:
+                current_seg.append(row)
+            else:
+                row_segments.append(current_seg)
+                current_seg = [row]
+        row_segments.append(current_seg)
+
+        # 4. 把切出来的每一块图提取出来
+        for seg in row_segments:
+            top = max(0, seg[0] - 15)
+            bottom = min(img_roi.height, seg[-1] + 15)
+            if bottom - top > 8:
+                imgs.append(img_roi.crop((0, top, W, bottom)))
 
     return imgs
 
@@ -257,12 +287,10 @@ def vconcat(imgs: List[Image.Image]) -> Optional[Image.Image]:
 
 
 def save_as_single_pdf(img: Image.Image, path: str, dpi: int):
-    """保存为单页长图 PDF（用于文章）"""
     img.save(path, "PDF", resolution=dpi)
 
 
 def save_as_a4_pdf(img: Image.Image, path: str, dpi: int):
-    """按 A4 比例切分并保存为多页 PDF（用于参考答案）"""
     a4_w = img.width
     a4_h = int(a4_w * 297 / 210)
     pages = []
@@ -333,7 +361,6 @@ def main():
         base = f"{u['date']}_{seq:02d}_{safe_filename(u['title'])}"
         out_pdf = os.path.join(args.outdir, base + ".pdf")
 
-        # 文章保存为单页
         save_as_single_pdf(long_img, out_pdf, args.dpi)
 
         index.append({
@@ -354,7 +381,6 @@ def main():
         full_img = vconcat(full_imgs)
         if full_img is not None:
             full_pdf = os.path.join(answers_dir, "answers_full.pdf")
-            # 参考答案按 A4 分页保存
             save_as_a4_pdf(full_img, full_pdf, args.dpi)
             print(f"[保存] {full_pdf}")
 
